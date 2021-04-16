@@ -27,6 +27,7 @@
 #pragma once
 
 #include <pthread.h>
+#include <boost/interprocess/offset_ptr.hpp>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -158,10 +159,14 @@ struct PythonBackendError {
 //
 // Exception thrown if error occurs in PythonBackend.
 //
-struct PythonBackendException {
+struct PythonBackendException : public std::exception {
   PythonBackendException(std::unique_ptr<PythonBackendError> err)
       : err_(std::move(err))
   {
+  }
+  virtual const char* what() const throw()
+  {
+    return err_->error_message.c_str();
   }
   std::unique_ptr<PythonBackendError> err_;
 };

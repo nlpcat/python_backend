@@ -82,6 +82,13 @@ FetchContent_MakeAvailable(pybind11)
 
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
+#
+# Boost
+#
+find_package(Boost REQUIRED)
+message(STATUS "Using Boost ${Boost_VERSION}")
+include_directories(${Boost_INCLUDE_DIRS})
+
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 find_package(Threads REQUIRED)
 

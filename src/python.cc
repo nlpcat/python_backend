@@ -176,6 +176,7 @@ struct BackendState {
   int64_t shm_default_byte_size;
   int64_t shm_growth_byte_size;
   int64_t stub_timeout_seconds;
+  std::unique_ptr<SharedMemoryManager> shm_manager;
 };
 
 class ModelState : public BackendModel {
@@ -696,17 +697,21 @@ ModelInstanceState::ProcessRequests(
 TRITONSERVER_Error*
 ModelInstanceState::SetupChildProcess()
 {
-  std::string kind = TRITONSERVER_InstanceGroupKindString(kind_);
-  std::string shm_region_name =
-      std::string("/") + Name() + "_" + kind + "_" + std::to_string(device_id_);
-
   ModelState* model_state = reinterpret_cast<ModelState*>(Model());
   int64_t shm_growth_size =
       model_state->StateForBackend()->shm_growth_byte_size;
   int64_t shm_default_size =
       model_state->StateForBackend()->shm_default_byte_size;
-  shm_pool_ = std::make_unique<SharedMemory>(
-      shm_region_name, shm_default_size, shm_growth_size, true /* truncate */);
+
+  // TODO: Fix portion of the shared memory allocated to each backend.
+  // TODO: Fix what happens if a growth is required here.
+  shm_pool_ = model_state->StateForBackend()->shm_manager->Region(
+      shm_default_size / 10);
+
+  std::string shm_data_key =
+      model_state->StateForBackend()->shm_manager->ShmDataKey();
+  std::string shm_control_key =
+      model_state->StateForBackend()->shm_manager->ShmControlKey();
 
   // Child Mutex and CV
   pthread_mutex_t* child_mutex;
@@ -773,23 +778,26 @@ ModelInstanceState::SetupChildProcess()
 
   // Child process
   if (pid == 0) {
-    const char* stub_args[7];
-    stub_args[6] = nullptr;  // Last argument must be nullptr
+    const char* stub_args[9];
+    stub_args[8] = nullptr;  // Last argument must be nullptr
     std::stringstream ss;
     ss << model_state->StateForBackend()->python_lib
        << "/triton_python_backend_stub";
     std::string stub_path = ss.str();
     stub_args[0] = stub_path.c_str();
     stub_args[1] = model_path_.c_str();
-    stub_args[2] = shm_region_name.c_str();
-    stub_args[3] = std::to_string(shm_default_size).c_str();
-    stub_args[4] = std::to_string(shm_growth_size).c_str();
-    stub_args[5] = std::to_string(parent_pid_).c_str();
+    stub_args[2] = shm_control_key.c_str();
+    stub_args[3] = shm_data_key.c_str();
+    stub_args[4] = std::to_string(shm_default_size).c_str();
+    stub_args[5] = std::to_string(shm_growth_size).c_str();
+    stub_args[6] = std::to_string(parent_pid_).c_str();
+    stub_args[7] = std::to_string(shm_pool_->Handle()).c_str();
     if (execvp(stub_args[0], (char**)stub_args) == -1) {
       std::stringstream ss;
       ss << "Failed to run python backend stub. Errno = " << errno << '\n'
          << "Python backend stub path: " << stub_path << '\n'
-         << "Shared Memory Region Name: " << shm_region_name << '\n'
+         << "Shared Memory Control Region Name: " << shm_control_key << '\n'
+         << "Shared Memory Data Region Name: " << shm_data_key << '\n'
          << "Shared Memory Default Byte Size: " << shm_default_size << '\n'
          << "Shared Memory Growth Byte Size: " << shm_growth_size << '\n';
       std::string log_message = ss.str();
@@ -816,7 +824,6 @@ ModelInstanceState::SetupChildProcess()
           (std::string("Failed to initialize model instance ") + Name())
               .c_str());
     }
-    LOG_MESSAGE(TRITONSERVER_LOG_INFO, "Preinit finished.");
 
     triton::common::TritonJson::WriteBuffer buffer;
     Model()->ModelConfig().Write(&buffer);
@@ -1083,6 +1090,11 @@ TRITONBACKEND_Initialize(TRITONBACKEND_Backend* backend)
        ",stub-timeout-seconds=" +
        std::to_string(backend_state->stub_timeout_seconds))
           .c_str());
+
+  backend_state->shm_manager = std::make_unique<SharedMemoryManager>(
+      "/python_backend_shm_ctrl", "/python_backend_shm_data",
+      backend_state->shm_default_byte_size,
+      backend_state->shm_growth_byte_size);
 
   // Use BackendArtifacts to determine the location of Python files
   const char* location;

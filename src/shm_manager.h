@@ -27,6 +27,7 @@
 #pragma once
 
 #include <unistd.h>
+#include <boost/interprocess/managed_shared_memory.hpp>
 #include <memory>
 #include <string>
 #include <utility>
@@ -34,12 +35,21 @@
 
 namespace triton { namespace backend { namespace python {
 
+namespace bi = boost::interprocess;
+
+struct SharedMemoryControl {
+  bool allocated;
+  size_t capacity;
+  bool has_grown;
+  char handle[64];
+};
+
 class SharedMemory {
-  int shm_fd_;
-  std::string shm_key_;
   size_t* capacity_;
   off_t* offset_;
   char* shm_addr_;
+  SharedMemoryControl* shm_control_block_;
+  bi::managed_shared_memory::handle_t control_block_handle_;
 
   // Current capcity, local to each process.
   size_t current_capacity_;
@@ -54,12 +64,32 @@ class SharedMemory {
 
  public:
   SharedMemory(
-      const std::string& shm_key, int64_t default_byte_size,
-      int64_t shm_growth_bytes, bool truncate = false);
+      void* shm_addr, SharedMemoryControl* shm_control_block,
+      bi::managed_shared_memory::handle_t control_block_handle);
   void MapOffset(char** shm_addr, size_t byte_size, off_t offset);
   void Map(char** shm_addr, size_t byte_size, off_t& offset);
   void SetOffset(off_t offset);
-  ~SharedMemory() noexcept(false);
+  bi::managed_shared_memory::handle_t Handle();
+  ~SharedMemory();
+};
+class SharedMemoryManager {
+  std::string shm_control_key_;
+  std::string shm_data_key_;
+  int64_t shm_growth_bytes_;
+  int64_t shm_default_bytes_;
+  bi::managed_shared_memory shm_data_;
+  bi::managed_shared_memory shm_control_;
+
+ public:
+  std::string ShmControlKey();
+  std::string ShmDataKey();
+
+  std::unique_ptr<SharedMemory> GetRegionFromHandle(
+      bi::managed_shared_memory::handle_t handle);
+  std::unique_ptr<SharedMemory> Region(const int64_t byte_size);
+  SharedMemoryManager(
+      const std::string& shm_control_key, const std::string& shm_data_key,
+      std::size_t default_byte_size, std::size_t growth_byte_size);
 };
 
 }}}  // namespace triton::backend::python

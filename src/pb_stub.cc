@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <boost/interprocess/managed_shared_memory.hpp>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -43,6 +44,8 @@ namespace py = pybind11;
 using namespace pybind11::literals;
 
 namespace triton { namespace backend { namespace python {
+
+namespace bi = boost::interprocess;
 
 #define LOG_IF_EXCEPTION(X)                                 \
   do {                                                      \
@@ -118,6 +121,7 @@ class Stub {
   std::string model_path_;
   IPCMessage* ipc_message_;
   std::unique_ptr<SharedMemory> shm_pool_;
+  std::unique_ptr<SharedMemoryManager> shm_manager_;
   py::object PyRequest_;
   py::object PyTensor_;
   py::object model_instance_;
@@ -128,7 +132,8 @@ class Stub {
  public:
   Stub(
       int64_t shm_growth_size, int64_t shm_default_size,
-      std::string& shm_region_name, std::string& model_path)
+      std::string& shm_data_key, std::string& shm_control_key,
+      std::string& model_path, bi::managed_shared_memory::handle_t handle)
   {
     model_path_ = model_path;
     child_mutex_ = nullptr;
@@ -136,8 +141,11 @@ class Stub {
     parent_mutex_ = nullptr;
     parent_cond_ = nullptr;
 
-    shm_pool_ = std::make_unique<SharedMemory>(
-        shm_region_name, shm_default_size, shm_growth_size);
+    shm_manager_ = std::make_unique<SharedMemoryManager>(
+        shm_control_key, shm_data_key, shm_default_size, shm_growth_size);
+
+
+    shm_pool_ = shm_manager_->GetRegionFromHandle(handle);
 
     // Child Mutex and CV
     pthread_mutex_t* child_mutex;
@@ -641,10 +649,15 @@ main(int argc, char** argv)
 
   // Path to model.py
   std::string model_path = argv[1];
-  std::string shm_region_name = argv[2];
-  int64_t shm_default_size = std::stoi(argv[3]);
+  std::string shm_control_region_name = argv[2];
+  std::string shm_data_region_name = argv[3];
+  int64_t shm_default_size = std::stoi(argv[4]);
 
   std::vector<std::string> model_path_tokens;
+  std::stringstream s;
+  s << argv[7];
+  bi::managed_shared_memory::handle_t handle = 0;
+  s >> handle;
 
   // Find the package name from model path.
   size_t prev = 0, pos = 0;
@@ -663,12 +676,13 @@ main(int argc, char** argv)
     exit(1);
   }
   std::string model_version = model_path_tokens[model_path_tokens.size() - 2];
-  int64_t shm_growth_size = std::stoi(argv[4]);
+  int64_t shm_growth_size = std::stoi(argv[5]);
 
   std::unique_ptr<Stub> stub;
   try {
     stub = std::make_unique<Stub>(
-        shm_growth_size, shm_default_size, shm_region_name, model_path);
+        shm_growth_size, shm_default_size, shm_data_region_name,
+        shm_control_region_name, model_path, handle);
   }
   catch (const PythonBackendException& pb_exception) {
     LOG_INFO << "Failed to preinitialize Python stub: "
@@ -683,7 +697,8 @@ main(int argc, char** argv)
 
   stub->Initialize(model_version, argv[0] /* python stub path*/);
 
-  pid_t parent_pid = std::stoi(argv[5]);
+  pid_t parent_pid = std::stoi(argv[6]);
+
   bool background_thread_running = true;
   std::thread background_thread([&parent_pid, &background_thread_running] {
     while (background_thread_running) {

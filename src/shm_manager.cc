@@ -29,57 +29,25 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <boost/interprocess/managed_shared_memory.hpp>
+#include <sstream>
 #include <string>
 #include "pb_utils.h"
 
 namespace triton { namespace backend { namespace python {
 
+namespace bi = boost::interprocess;
+
 SharedMemory::SharedMemory(
-    const std::string& shm_key, int64_t default_byte_size,
-    int64_t shm_growth_bytes, bool truncate)
+    void* shm_addr, SharedMemoryControl* shm_control_block,
+    bi::managed_shared_memory::handle_t control_block_handle)
 {
-  if (truncate) {
-    shm_fd_ = shm_open(
-        shm_key.c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-  } else {
-    shm_fd_ = shm_open(shm_key.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-  }
-  if (shm_fd_ == -1) {
-    std::unique_ptr<PythonBackendError> err =
-        std::make_unique<PythonBackendError>();
-    err->error_message =
-        ("unable to get shared memory descriptor for shared-memory key '" +
-         shm_key + "'");
-    throw PythonBackendException(std::move(err));
-  }
-
-  shm_growth_bytes_ = shm_growth_bytes;
-  int res = ftruncate(shm_fd_, default_byte_size);
-  if (res == -1) {
-    std::unique_ptr<PythonBackendError> err =
-        std::make_unique<PythonBackendError>();
-    err->error_message =
-        ("unable to initialize shared-memory key '" + shm_key +
-         "' to requested size: " + std::to_string(default_byte_size) +
-         " bytes");
-    throw PythonBackendException(std::move(err));
-  }
-
-  void* map_addr = mmap(
-      NULL, default_byte_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0);
-
-  if (map_addr == MAP_FAILED) {
-    std::unique_ptr<PythonBackendError> err =
-        std::make_unique<PythonBackendError>();
-    err->error_message =
-        ("unable to process address space or shared-memory descriptor: " +
-         std::to_string(shm_fd_));
-    throw PythonBackendException(std::move(err));
-  }
-  shm_addr_ = (char*)map_addr;
+  control_block_handle_ = control_block_handle;
+  shm_addr_ = static_cast<char*>(shm_addr);
+  shm_control_block_ = shm_control_block;
 
   capacity_ = (size_t*)shm_addr_;
-  *capacity_ = default_byte_size;
+  *capacity_ = shm_control_block_->capacity;
   current_capacity_ = *capacity_;
 
   // Set offset address
@@ -88,61 +56,28 @@ SharedMemory::SharedMemory(
   *offset_ = 0;
   *offset_ += sizeof(off_t);
   *offset_ += sizeof(size_t);
-
-  shm_key_ = shm_key;
 }
 
-SharedMemory::~SharedMemory() noexcept(false)
-{
-  // TODO: Deallocate the first address
-  for (auto& pair : old_shm_addresses_) {
-    int status = munmap(pair.second, pair.first);
-    if (status == -1) {
-      std::unique_ptr<PythonBackendError> err =
-          std::make_unique<PythonBackendError>();
-      err->error_message = "unable to munmap shared memory region";
-      throw PythonBackendException(std::move(err));
-    }
-  }
-
-  // Close fd
-  if (close(shm_fd_) == -1) {
-    std::unique_ptr<PythonBackendError> err =
-        std::make_unique<PythonBackendError>();
-    err->error_message =
-        ("unable to close shared-memory descriptor: " +
-         std::to_string(shm_fd_));
-    throw PythonBackendException(std::move(err));
-  }
-
-  // Unlink shared memory
-  int error = shm_unlink(shm_key_.c_str());
-  if (error == -1) {
-    std::unique_ptr<PythonBackendError> err =
-        std::make_unique<PythonBackendError>();
-    err->error_message =
-        ("unable to unlink shared memory for key '" + shm_key_ + "'");
-    throw PythonBackendException(std::move(err));
-  }
-}
+SharedMemory::~SharedMemory() {}
 
 void
 SharedMemory::Map(char** shm_addr, size_t byte_size, off_t& offset)
 {
-  while (*offset_ + byte_size >= *capacity_) {
-    // Increase the shared memory pool size by one page size.
-    *capacity_ = *offset_ + byte_size + shm_growth_bytes_;
-    if (ftruncate(shm_fd_, *capacity_) == -1) {
-      std::unique_ptr<PythonBackendError> err =
-          std::make_unique<PythonBackendError>();
-      err->error_message =
-          ("Failed to increase the shared memory pool size for key '" +
-           shm_key_ + "' to " + std::to_string(*capacity_) + " bytes");
-      throw PythonBackendException(std::move(err));
-    }
-  }
+  // What to do for growing the shared memory?
+  // while (*offset_ + byte_size >= *capacity_) {
+  // // Increase the shared memory pool size by one page size.
+  // *capacity_ = *offset_ + byte_size + shm_growth_bytes_;
+  // if (ftruncate(shm_fd_, *capacity_) == -1) {
+  // std::unique_ptr<PythonBackendError> err =
+  // std::make_unique<PythonBackendError>();
+  // err->error_message =
+  // ("Failed to increase the shared memory pool size for key '" +
+  // shm_key_ + "' to " + std::to_string(*capacity_) + " bytes");
+  // throw PythonBackendException(std::move(err));
+  // }
+  // }
 
-  UpdateSharedMemory();
+  // UpdateSharedMemory();
 
   *shm_addr = shm_addr_ + *offset_;
   offset = *offset_;
@@ -153,30 +88,31 @@ SharedMemory::Map(char** shm_addr, size_t byte_size, off_t& offset)
 void
 SharedMemory::UpdateSharedMemory()
 {
-  if (current_capacity_ != *capacity_) {
-    void* map_addr =
-        mmap(NULL, *capacity_, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0);
+  // if (current_capacity_ != *capacity_) {
+  //   void* map_addr =
+  //       mmap(NULL, *capacity_, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_,
+  //       0);
 
-    if (map_addr == MAP_FAILED) {
-      std::unique_ptr<PythonBackendError> err =
-          std::make_unique<PythonBackendError>();
-      err->error_message =
-          ("unable to process address space or shared-memory descriptor: " +
-           std::to_string(shm_fd_));
-      throw PythonBackendException(std::move(err));
-    }
+  //   if (map_addr == MAP_FAILED) {
+  //     std::unique_ptr<PythonBackendError> err =
+  //         std::make_unique<PythonBackendError>();
+  //     err->error_message =
+  //         ("unable to process address space or shared-memory descriptor: " +
+  //          std::to_string(shm_fd_));
+  //     throw PythonBackendException(std::move(err));
+  //   }
 
-    old_shm_addresses_.push_back({current_capacity_, shm_addr_});
-    current_capacity_ = *capacity_;
-    shm_addr_ = (char*)map_addr;
-  }
+  //   old_shm_addresses_.push_back({current_capacity_, shm_addr_});
+  //   current_capacity_ = *capacity_;
+  //   shm_addr_ = (char*)map_addr;
+  // }
 }
 
 void
 SharedMemory::MapOffset(char** shm_addr, size_t byte_size, off_t offset)
 {
   // Update shared memory pointer and capacity if necessary.
-  UpdateSharedMemory();
+  // UpdateSharedMemory();
   *shm_addr = shm_addr_ + offset;
 }
 
@@ -184,6 +120,71 @@ void
 SharedMemory::SetOffset(off_t offset)
 {
   *offset_ = offset;
+}
+
+bi::managed_shared_memory::handle_t
+SharedMemory::Handle()
+{
+  return control_block_handle_;
+}
+
+SharedMemoryManager::SharedMemoryManager(
+    const std::string& shm_control_key, const std::string& shm_data_key,
+    std::size_t default_byte_size, std::size_t growth_byte_size)
+{
+  shm_control_key_ = shm_control_key;
+  shm_data_key_ = shm_data_key;
+  shm_growth_bytes_ = growth_byte_size;
+  shm_default_bytes_ = default_byte_size;
+  shm_data_ = bi::managed_shared_memory(
+      bi::open_or_create, shm_data_key_.c_str(), default_byte_size);
+  shm_control_ = bi::managed_shared_memory(
+      bi::open_or_create, shm_control_key_.c_str(), default_byte_size);
+}
+
+std::unique_ptr<SharedMemory>
+SharedMemoryManager::Region(const int64_t byte_size)
+{
+  void* ptr = shm_data_.allocate(byte_size);
+  void* shm_control = shm_control_.allocate(sizeof(SharedMemoryControl));
+  SharedMemoryControl* shared_memory_control =
+      static_cast<SharedMemoryControl*>(shm_control);
+  shared_memory_control->capacity = byte_size;
+  bi::managed_shared_memory::handle_t handle =
+      shm_data_.get_handle_from_address(ptr);
+  std::stringstream s;
+  s << handle;
+  strcpy(shared_memory_control->handle, s.str().c_str());
+  return std::make_unique<SharedMemory>(
+      ptr, shared_memory_control,
+      shm_control_.get_handle_from_address(shm_control));
+}
+
+std::unique_ptr<SharedMemory>
+SharedMemoryManager::GetRegionFromHandle(
+    bi::managed_shared_memory::handle_t handle)
+{
+  SharedMemoryControl* shared_memory_control =
+      static_cast<SharedMemoryControl*>(
+          shm_control_.get_address_from_handle(handle));
+  bi::managed_shared_memory::handle_t handle_data = 0;
+  std::stringstream s;
+  s << shared_memory_control->handle;
+  s >> handle_data;
+  void* ptr = shm_data_.get_address_from_handle(handle_data);
+  return std::make_unique<SharedMemory>(ptr, shared_memory_control, handle);
+}
+
+std::string
+SharedMemoryManager::ShmControlKey()
+{
+  return shm_control_key_;
+}
+
+std::string
+SharedMemoryManager::ShmDataKey()
+{
+  return shm_data_key_;
 }
 
 }}}  // namespace triton::backend::python
